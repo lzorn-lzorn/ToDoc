@@ -135,7 +135,7 @@ struct SegmentDetail {
 }
 
 /// 解析标签节点中的关键字标签和普通文本。
-fn parse_segment_detail(segment: &[Token], default_format: &str) -> SegmentDetail {
+fn parse_segment_detail(segment: &[Token], _default_format: &str) -> SegmentDetail {
     let mut detail = SegmentDetail::default();
     let mut plain_text = String::new();
     let mut explicit_content: Vec<String> = Vec::new();
@@ -165,7 +165,6 @@ fn parse_segment_detail(segment: &[Token], default_format: &str) -> SegmentDetai
         if auto_content.is_empty() {
             String::new()
         } else {
-            let _format_hint = default_format;
             auto_content
         }
     } else {

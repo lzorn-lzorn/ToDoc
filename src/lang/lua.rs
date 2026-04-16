@@ -50,7 +50,7 @@ impl LanguageParser for LuaParser {
                 });
                 comment_buffer.clear();
             } else if !line.trim().is_empty() {
-                // 非注释且非函数定义时，清空暂存，避免跨段错误绑定。
+                // 非注释且非函数定义时，清空缓存，避免跨段错误绑定。
                 comment_buffer.clear();
             }
         }

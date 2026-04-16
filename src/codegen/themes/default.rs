@@ -1,4 +1,4 @@
-//! 柔和主题 CSS。
+//! 默认主题 CSS：Gruvbox 代码块 + 参数名浅绿 + "参数"深绿。
 
 /// 返回内嵌 CSS 文本。
 pub fn css() -> &'static str {
@@ -7,11 +7,14 @@ pub fn css() -> &'static str {
   --bg: #FAFAF8;
   --text: #3C3C3C;
   --title: #2C5F7C;
-  --code-bg: #F0EDE6;
   --link: #4A90A4;
   --todo: #C84B31;
   --deprecated: #888888;
   --card-border: #E6E2DA;
+  /* Gruvbox 代码配色 */
+  --code-bg: #282828;
+  --code-fg: #ebdbb2;
+  --code-border: #3c3836;
 }
 body {
   background: var(--bg);
@@ -33,11 +36,34 @@ h1, h2, h3 { color: var(--title); }
   padding: 16px;
   margin-bottom: 16px;
 }
-code, pre {
+
+/* ── Gruvbox 代码块（行内 + 块级） ── */
+code {
   background: var(--code-bg);
-  border-radius: 6px;
+  color: var(--code-fg);
+  border-radius: 4px;
+  padding: 2px 6px;
+  font-size: 0.92em;
 }
-pre { padding: 12px; overflow-x: auto; }
+pre {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  border: 1px solid var(--code-border);
+  border-radius: 6px;
+  padding: 12px;
+  overflow-x: auto;
+}
+pre code {
+  background: none;
+  padding: 0;
+  border-radius: 0;
+}
+
+/* ── 参数样式 ── */
+.param-heading { color: #1B5E20; font-weight: 600; }
+.param-name { color: #66BB6A; font-weight: 600; }
+
+/* ── 其他 ── */
 .todo { color: var(--todo); font-weight: 600; }
 .todo-heading { color: var(--todo); }
 .note-text { color: #4a7c59; margin: 4px 0; }

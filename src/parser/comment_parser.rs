@@ -14,6 +14,7 @@ pub struct ParsedComment {
     pub deprecated: bool,
     pub todos: Vec<String>,
     pub exported: bool,
+    pub has_tags: bool,
     pub raw_comment: String,
 }
 
@@ -33,8 +34,16 @@ pub fn parse_comment(raw_comment: &str, config: &Config) -> ParsedComment {
     for token in tokens {
         match token {
             Token::Tag(name) => {
+                result.has_tags = true;
                 if let Some(tag) = current_tag.take() {
                     apply_tag_segment(&mut result, &tag, &current_segment, config);
+                    current_segment.clear();
+                } else if !current_segment.is_empty() {
+                    // 首个标签前的文本应作为自由描述，不应错误并入第一个标签。
+                    let leading_text = extract_plain_text(&current_segment);
+                    if !leading_text.is_empty() && result.brief.is_none() {
+                        result.brief = Some(leading_text);
+                    }
                     current_segment.clear();
                 }
                 current_tag = Some(normalize_tag_name(&name));
@@ -61,7 +70,12 @@ pub fn parse_comment(raw_comment: &str, config: &Config) -> ParsedComment {
 
 /// 统一标签名：忽略大小写和可选冒号。
 fn normalize_tag_name(name: &str) -> String {
-    name.trim().trim_end_matches(':').to_ascii_lowercase()
+    let normalized = name.trim().trim_end_matches(':').to_ascii_lowercase();
+    match normalized.as_str() {
+        // 兼容项目中常见拼写。
+        "breif" => "brief".to_string(),
+        _ => normalized,
+    }
 }
 
 /// 将一个标签节点的内容应用到解析结果中。
@@ -171,15 +185,34 @@ fn parse_segment_detail(segment: &[Token], _default_format: &str) -> SegmentDeta
         explicit_content.join("\n")
     };
 
-    detail.content = merged.clone();
+    detail.content = strip_leading_separator(&merged).to_string();
 
     // 参数标签中：若普通文本以“name description”形式出现，拆分为描述。
     let trimmed_plain = plain_text.trim();
     if !trimmed_plain.is_empty() {
         if let Some((_, desc)) = trimmed_plain.split_once(char::is_whitespace) {
-            detail.description = Some(desc.trim().to_string());
+            detail.description = Some(strip_leading_separator(desc.trim()).to_string());
         }
     }
 
     detail
+}
+
+fn extract_plain_text(segment: &[Token]) -> String {
+    let mut plain = String::new();
+    for token in segment {
+        match token {
+            Token::Text(text) => plain.push_str(text),
+            Token::Newline => plain.push('\n'),
+            _ => {}
+        }
+    }
+    plain.trim().to_string()
+}
+
+fn strip_leading_separator(input: &str) -> &str {
+    input
+        .trim_start()
+        .trim_start_matches(':')
+        .trim_start()
 }

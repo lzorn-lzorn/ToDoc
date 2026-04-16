@@ -1,5 +1,12 @@
 {
-  "cache_dir": ".todoc_cache",
-  "output_dir": "docs",
-  "default_format": "markdown"
+    "workspace": ".",
+    "cache_dir": ".todoc/cache",
+    "doc_target_out_dir": ".todoc/docs",
+    "default_format": "markdown",
+    "sources": {
+        "examples": []
+    },
+    "source_code": ".",
+    "target_code": "html",
+    "theme": "default"
 }

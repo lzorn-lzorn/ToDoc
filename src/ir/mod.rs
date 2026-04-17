@@ -2,4 +2,4 @@
 
 pub mod types;
 
-pub use types::{ApiDoc, FileDoc, FuncType, ParamDoc, ReturnDoc};
+pub use types::{ApiDoc, FileDoc, FuncType, ParamDoc, ReturnDoc, UsageDoc};

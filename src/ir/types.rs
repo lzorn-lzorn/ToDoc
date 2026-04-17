@@ -36,9 +36,19 @@ pub struct ApiDoc {
     pub params: Vec<ParamDoc>,
     pub returns: Vec<ReturnDoc>,
     pub notes: Vec<String>,
+    #[serde(default)]
+    pub usages: Vec<UsageDoc>,
     pub deprecated: bool,
     pub todos: Vec<String>,
     pub raw_comment: String,
+}
+
+/// 用法引用文档。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsageDoc {
+    pub content: String,
+    pub path: Option<String>,
+    pub api_name: Option<String>,
 }
 
 /// 参数文档。

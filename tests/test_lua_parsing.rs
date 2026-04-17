@@ -322,7 +322,7 @@ end\n";
     // brief 应该将延续行合并，不含多余的 @。
     let brief = api.brief.as_deref().unwrap();
     assert!(
-        brief.contains("完整 信息"),
+        brief.contains("完整\n信息"),
         "brief 应合并延续行: {:?}",
         brief
     );
@@ -333,7 +333,209 @@ end\n";
     );
     // param 应正常解析。
     assert_eq!(api.params.len(), 1);
-    assert_eq!(api.params[0].name, "bGetFirst,");
+    assert_eq!(api.params[0].name, "bGetFirst");
 
     let _ = fs::remove_file(path);
 }
+
+#[test]
+fn test_brief_sugar_syntax() {
+    let path = temp_lua_path();
+    // 测试 @brief 语法糖：
+    //   1) @brief content → \content[default_format]{content}
+    //   2) 多行延续（@ + 空白 / 普通文本行）保持换行
+    //   3) @note 同理
+    let content = r#"---<!export>
+--- @brief 第一行描述
+--- @  第二行延续
+--- @note 注释第一行
+--- @  注释第二行
+--- @  注释第三行
+function bar()
+end
+"#;
+    fs::write(&path, content).expect("写入");
+
+    let doc = LuaParser
+        .parse_file(&path, &Config::default())
+        .unwrap();
+
+    assert_eq!(doc.apis.len(), 1);
+    let api = &doc.apis[0];
+
+    // brief 应包含换行。
+    let brief = api.brief.as_deref().unwrap();
+    assert!(
+        brief.contains("第一行描述\n第二行延续"),
+        "brief should preserve newlines: {:?}",
+        brief
+    );
+
+    // note 应包含换行。
+    assert_eq!(api.notes.len(), 1);
+    let note = &api.notes[0];
+    assert!(
+        note.contains("注释第一行\n注释第二行\n注释第三行"),
+        "note should preserve newlines: {:?}",
+        note
+    );
+
+    let _ = fs::remove_file(path);
+}
+
+#[test]
+fn test_param_sugar_syntax() {
+    let path = temp_lua_path();
+    // 测试 @param 语法糖：
+    //   1) `@param name \type typename content`
+    //   2) `@param name content` (无 \type)
+    //   3) 多行延续 content
+    //   4) 带逗号的 name
+    //   5) 已有正式语法不受影响
+    let content = r#"---<!export>
+--- @brief Test sugar
+--- @param id \type number the item id
+--- @param name, the player name
+--- @  with continuation
+--- @param \name{x} \type{number} \content{formal syntax}
+function foo(id, name, x)
+end
+"#;
+    fs::write(&path, content).expect("写入");
+
+    let doc = LuaParser
+        .parse_file(&path, &Config::default())
+        .unwrap();
+
+    assert_eq!(doc.apis.len(), 1);
+    let api = &doc.apis[0];
+    assert_eq!(api.params.len(), 3);
+
+    // 第 1 个参数：语法糖 + \type
+    assert_eq!(api.params[0].name, "id");
+    assert_eq!(api.params[0].type_name.as_deref(), Some("number"));
+    assert!(
+        api.params[0].description.contains("the item id"),
+        "param[0] desc: {:?}",
+        api.params[0].description
+    );
+
+    // 第 2 个参数：语法糖 + 无 \type + 延续行
+    assert_eq!(api.params[1].name, "name");
+    assert!(
+        api.params[1].description.contains("the player name"),
+        "param[1] desc: {:?}",
+        api.params[1].description
+    );
+    assert!(
+        api.params[1].description.contains("with continuation"),
+        "param[1] should include continuation: {:?}",
+        api.params[1].description
+    );
+
+    // 第 3 个参数：正式语法不受影响
+    assert_eq!(api.params[2].name, "x");
+    assert_eq!(api.params[2].type_name.as_deref(), Some("number"));
+    assert!(
+        api.params[2].description.contains("formal syntax"),
+        "param[2] desc: {:?}",
+        api.params[2].description
+    );
+
+    let _ = fs::remove_file(path);
+}
+
+#[test]
+fn test_usage_tag_parsing() {
+    let path = temp_lua_path();
+    let content = r#"---<!export>
+--- @brief usage case
+--- @usage \\content{来自购买流程} \\path{examples/ShopHelper.lua} \\apiname{BuyItem}
+--- @usage 纯文本usage
+--- @  第二行
+function T.Caller()
+end
+"#;
+    fs::write(&path, content).expect("写入");
+
+    let doc = LuaParser
+        .parse_file(&path, &Config::default())
+        .unwrap();
+
+    assert_eq!(doc.apis.len(), 1);
+    let api = &doc.apis[0];
+    assert_eq!(api.usages.len(), 2);
+
+    assert_eq!(api.usages[0].content, "来自购买流程");
+    assert_eq!(api.usages[0].path.as_deref(), Some("examples/ShopHelper.lua"));
+    assert_eq!(api.usages[0].api_name.as_deref(), Some("BuyItem"));
+
+    assert!(api.usages[1].content.contains("纯文本usage\n第二行"));
+    assert!(api.usages[1].path.is_none());
+    assert!(api.usages[1].api_name.is_none());
+
+    let _ = fs::remove_file(path);
+}
+
+#[test]
+fn test_param_defualt_alias_parsing() {
+    let path = temp_lua_path();
+    let content = r#"---<!export>
+--- @param \name{count} \type{number} \defualt{1} \content{数量}
+function T.Buy(count)
+end
+"#;
+    fs::write(&path, content).expect("写入");
+
+    let doc = LuaParser
+        .parse_file(&path, &Config::default())
+        .unwrap();
+
+    assert_eq!(doc.apis.len(), 1);
+    let api = &doc.apis[0];
+    assert_eq!(api.params.len(), 1);
+    assert_eq!(api.params[0].default_value.as_deref(), Some("1"));
+
+    let _ = fs::remove_file(path);
+}
+
+#[test]
+fn test_param_followed_by_block_comment_with_explicit_content() {
+    let path = temp_lua_path();
+    let content = r#"
+-- @breif 购买接口 Ver2 支持多货币结算的商品
+-- @param PayParams 购买参数,
+--[[\content{
+```lua
+{
+    iCoinItemId = int, 
+    iNeedCoinNum = int, 
+    iBuyNum = int, 
+    iStoreId = int, 
+    iShopId = int,
+}
+```
+}]]
+function T.Buy(PayParams)
+end
+"#;
+    std::fs::write(&path, content).expect("应能写入临时 Lua 文件");
+
+    let parser = LuaParser;
+    let doc = parser
+        .parse_file(&path, &Config::default())
+        .expect("Lua 文件应能成功解析");
+
+    assert_eq!(doc.apis.len(), 1);
+    let api = &doc.apis[0];
+    assert_eq!(api.name, "Buy");
+    assert_eq!(api.params.len(), 1);
+    assert_eq!(api.params[0].name, "PayParams");
+    assert!(api.params[0].description.contains("购买参数"));
+    // block comment 的 \\content 应不会被并入 param 描述
+    assert!(!api.params[0].description.contains("iCoinItemId"));
+    // raw_comment 应包含 block comment
+    assert!(api.raw_comment.contains("iCoinItemId"));
+    let _ = std::fs::remove_file(path);
+}
+

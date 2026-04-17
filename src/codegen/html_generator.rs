@@ -1,6 +1,6 @@
 //! HTML 生成器：将 IR 渲染为文件页与索引页，按源码目录树组织输出。
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -33,6 +33,29 @@ impl HtmlGenerator {
         readme_files: &[PathBuf],
     ) -> Result<()> {
         fs::create_dir_all(output_dir)?;
+
+        // 预构建可跳转目标：仅包含会输出到 HTML 的导出 API。
+        let mut usage_targets: HashMap<String, String> = HashMap::new();
+        for doc in docs {
+            let rel = relative_path(&doc.file_path, source_root);
+            let page_rel = rel
+                .parent()
+                .unwrap_or(Path::new(""))
+                .join(source_file_to_html_name(&doc.file_path));
+            for api in &doc.apis {
+                if !api.exported {
+                    continue;
+                }
+                let key = format!(
+                    "{}::{}",
+                    normalize_path_key(&doc.file_path),
+                    api.name.to_ascii_lowercase()
+                );
+                let anchor = api_anchor_id(api);
+                let target = format!("{}#{}", path_to_href(&page_rel), anchor);
+                usage_targets.insert(key, target);
+            }
+        }
 
         // 收集源码目录树中所有子目录（相对路径），使空目录也能出现。
         let mut all_dirs: BTreeSet<PathBuf> = BTreeSet::new();
@@ -73,7 +96,7 @@ impl HtmlGenerator {
                 for doc in file_docs {
                     let file_name = source_file_to_html_name(&doc.file_path);
                     let back_link = "index.html".to_string();
-                    let page = self.render_file_page(doc, &back_link);
+                    let page = self.render_file_page(doc, &back_link, dir, source_root, &usage_targets);
                     fs::write(out_subdir.join(&file_name), page)?;
                 }
             }
@@ -124,13 +147,23 @@ impl HtmlGenerator {
     }
 
     /// 渲染单文件页面。
-    fn render_file_page(&self, doc: &FileDoc, back_link: &str) -> String {
+    fn render_file_page(
+        &self,
+        doc: &FileDoc,
+        back_link: &str,
+        current_dir: &Path,
+        source_root: &Path,
+        usage_targets: &HashMap<String, String>,
+    ) -> String {
         let css = themes::css_for_theme(&self.theme);
+        let sidebar_html = build_todo_sidebar(doc);
         let mut html_out = String::new();
         html_out.push_str("<!doctype html><html><head><meta charset=\"utf-8\"><title>ToDoc</title>");
         html_out.push_str("<style>");
         html_out.push_str(css);
-        html_out.push_str("</style></head><body><div class=\"container\">");
+        html_out.push_str("</style></head><body><div class=\"page-layout\">");
+        html_out.push_str(&sidebar_html);
+        html_out.push_str("<div class=\"container\">");
 
         // 标题只显示文件名。
         let display_name = Path::new(&doc.file_path)
@@ -155,14 +188,14 @@ impl HtmlGenerator {
             if !api.exported {
                 continue;
             }
-            html_out.push_str(&self.render_api_card(api));
+            html_out.push_str(&self.render_api_card(api, current_dir, source_root, usage_targets));
         }
 
         html_out.push_str(&format!(
             "<p><a href=\"{}\">返回索引</a></p>",
             escape_html(back_link)
         ));
-        html_out.push_str("</div></body></html>");
+        html_out.push_str("</div></div></body></html>"); // close .container + .page-layout
         html_out
     }
 
@@ -228,13 +261,20 @@ impl HtmlGenerator {
     }
 
     /// 渲染单个 API 卡片。
-    fn render_api_card(&self, api: &ApiDoc) -> String {
+    fn render_api_card(
+        &self,
+        api: &ApiDoc,
+        current_dir: &Path,
+        source_root: &Path,
+        usage_targets: &HashMap<String, String>,
+    ) -> String {
         use crate::ir::FuncType;
 
         let mut out = String::new();
         let location_link = format!("vscode://file/{}:{}", api.file_path, api.line_number);
 
-        out.push_str("<div class=\"card\">");
+        let anchor_id = api_anchor_id(api);
+        out.push_str(&format!("<div class=\"card\" id=\"{}\">", escape_html(&anchor_id)));
         out.push_str(&format!(
             "<h3><a href=\"{}\">{}</a></h3>",
             escape_html(&location_link),
@@ -265,12 +305,12 @@ impl HtmlGenerator {
             out.push_str("<h4 class=\"param-heading\">参数</h4><ul>");
             for p in &api.params {
                 out.push_str("<li>");
-                out.push_str(&format!("<span class=\"param-name\">{}</span>", escape_html(&p.name)));
+                out.push_str(&format!("<code class=\"param-name\">{}</code>", escape_html(&p.name)));
                 if let Some(t) = &p.type_name {
-                    out.push_str(&format!(" <code>{}</code>", escape_html(t)));
+                    out.push_str(&format!(" <span class=\"param-type\">{}</span>", escape_html(t)));
                 }
                 if let Some(d) = &p.default_value {
-                    out.push_str(&format!(" 默认=<code>{}</code>", escape_html(d)));
+                    out.push_str(&format!(" 默认=<code class=\"param-default\">{}</code>", escape_html(d)));
                 }
                 out.push_str(&format!(" - {}", render_markdown_inline(&p.description)));
                 out.push_str("</li>");
@@ -292,10 +332,66 @@ impl HtmlGenerator {
         }
 
         if !api.notes.is_empty() {
-            out.push_str("<h4>备注</h4>");
             for note in &api.notes {
-                out.push_str(&format!("<p class=\"note-text\">{}</p>", render_markdown_inline(note)));
+                out.push_str(&render_note_html(note));
             }
+        }
+
+        if !api.usages.is_empty() {
+            out.push_str("<h4 class=\"note-heading\">Usage</h4><ul>");
+            for usage in &api.usages {
+                out.push_str("<li>");
+                if !usage.content.trim().is_empty() {
+                    out.push_str(&render_markdown_inline(&usage.content));
+                }
+
+                let resolved_path = usage
+                    .path
+                    .as_deref()
+                    .map(|p| resolve_usage_path(source_root, p));
+
+                if let Some(path) = &usage.path {
+                    let abs = resolve_usage_path(source_root, path);
+                    let file_href = format!("vscode://file/{}", path_to_href(&abs));
+                    out.push_str(" <span class=\"meta\">[path: ");
+                    out.push_str(&format!(
+                        "<a href=\"{}\"><code>{}</code></a>",
+                        escape_html(&file_href),
+                        escape_html(path)
+                    ));
+                    out.push_str("]</span>");
+                }
+
+                if let Some(api_name) = &usage.api_name {
+                    let maybe_target = resolved_path.as_ref().and_then(|p| {
+                        let key = format!("{}::{}", normalize_path_key(&p.to_string_lossy()), api_name.to_ascii_lowercase());
+                        usage_targets.get(&key)
+                    });
+
+                    out.push_str(" <span class=\"meta\">[api: ");
+                    if let Some(target) = maybe_target {
+                        let target_path = target.split('#').next().unwrap_or(target);
+                        let rel_target = relative_href_from_dir(current_dir, Path::new(target_path));
+                        let anchor = target.split('#').nth(1).unwrap_or("");
+                        let href = if anchor.is_empty() {
+                            rel_target
+                        } else {
+                            format!("{}#{}", rel_target, anchor)
+                        };
+                        out.push_str(&format!(
+                            "<a href=\"{}\"><code>{}</code></a>",
+                            escape_html(&href),
+                            escape_html(api_name)
+                        ));
+                    } else {
+                        out.push_str(&format!("<code>{}</code>", escape_html(api_name)));
+                    }
+                    out.push_str("]</span>");
+                }
+
+                out.push_str("</li>");
+            }
+            out.push_str("</ul>");
         }
 
         if api.deprecated {
@@ -366,6 +462,70 @@ fn source_file_to_html_name(path: &str) -> String {
     format!("{}.html", name)
 }
 
+fn api_anchor_id(api: &ApiDoc) -> String {
+    format!("api-{}-{}", slugify(&api.qualified_name()), api.line_number)
+}
+
+fn slugify(input: &str) -> String {
+    input
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+}
+
+fn normalize_path_key(input: &str) -> String {
+    input
+    .trim_start_matches("\\\\?\\")
+        .replace('\\', "/")
+        .to_ascii_lowercase()
+}
+
+fn path_to_href(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+fn resolve_usage_path(source_root: &Path, usage_path: &str) -> PathBuf {
+    let p = Path::new(usage_path);
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        source_root.join(p)
+    }
+}
+
+fn relative_href_from_dir(from_dir: &Path, to_file: &Path) -> String {
+    let from: Vec<String> = from_dir
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().to_string())
+        .collect();
+    let to: Vec<String> = to_file
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().to_string())
+        .collect();
+
+    let mut common = 0;
+    while common < from.len() && common < to.len() && from[common] == to[common] {
+        common += 1;
+    }
+
+    let mut rel = PathBuf::new();
+    for _ in common..from.len() {
+        rel.push("..");
+    }
+    for part in to.iter().skip(common) {
+        rel.push(part);
+    }
+
+    let href = rel.to_string_lossy().replace('\\', "/");
+    if href.is_empty() { "index.html".to_string() } else { href }
+}
+
 /// 包装 README 渲染结果为自包含 HTML 页面。
 fn wrap_readme_html(title: &str, body_html: &str, theme: &str) -> String {
     format!(
@@ -381,6 +541,65 @@ fn wrap_readme_html(title: &str, body_html: &str, theme: &str) -> String {
 }
 
 /// 以 markdown 模式渲染文本。
+/// 渲染单条备注：若内容是块级元素（列表/代码块/表格），则保留 "备注" 标题独行；
+/// 否则渲染为行内 "备注：内容" 格式。
+fn render_note_html(note: &str) -> String {
+    let rendered = render_markdown_inline(note);
+    let trimmed = rendered.trim_start();
+    let is_block = trimmed.starts_with("<ul")
+        || trimmed.starts_with("<ol")
+        || trimmed.starts_with("<pre")
+        || trimmed.starts_with("<table");
+    if is_block {
+        format!(
+            "<div class=\"note-text\"><span class=\"note-heading\">备注</span>{}</div>",
+            rendered
+        )
+    } else {
+        format!(
+            "<p class=\"note-text\"><span class=\"note-heading\">备注：</span>{}</p>",
+            rendered
+        )
+    }
+}
+
+/// 收集文件内所有导出 API 的 TODO 项，构建侧边栏 HTML。
+/// 若无任何 TODO，返回空字符串。
+fn build_todo_sidebar(doc: &crate::ir::FileDoc) -> String {
+    let items: Vec<(String, String, String)> = doc
+        .apis
+        .iter()
+        .filter(|a| a.exported && !a.todos.is_empty())
+        .flat_map(|a| {
+            let anchor = api_anchor_id(a);
+            let name = a.name.clone();
+            a.todos
+                .iter()
+                .map(move |t| (anchor.clone(), name.clone(), t.clone()))
+        })
+        .collect();
+
+    if items.is_empty() {
+        return String::new();
+    }
+
+    let mut s = String::from(
+        "<aside class=\"todo-sidebar\"><h3>TODO</h3><ul>",
+    );
+    for (anchor, api_name, todo_text) in &items {
+        let display = render_markdown_inline(todo_text);
+        s.push_str(&format!(
+            "<li><a href=\"#{anchor}\"><span class=\"sidebar-api-name\">{name}</span>\
+             <span class=\"sidebar-todo-text\">{todo}</span></a></li>",
+            anchor = escape_html(anchor),
+            name = escape_html(api_name),
+            todo = display,
+        ));
+    }
+    s.push_str("</ul></aside>");
+    s
+}
+
 fn render_markdown(text: &str) -> String {
     let parser = Parser::new_ext(text, Options::all());
     let mut out = String::new();

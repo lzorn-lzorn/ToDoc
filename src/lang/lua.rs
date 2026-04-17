@@ -91,11 +91,16 @@ impl LanguageParser for LuaParser {
                     join_continuation_lines(&mut comment_buffer);
                     let raw_comment = comment_buffer.join("\n");
                     let parsed = parse_comment(&raw_comment, config);
+                    // @private 显式禁止导出，优先级最高。
                     // local function 默认不导出，除非显式 @export。
                     // TableMethod / Global 只在有标签或显式 @export 时导出。
-                    let exported = match func_type {
-                        FuncType::Local => parsed.exported,
-                        _ => parsed.exported || parsed.has_tags,
+                    let exported = if parsed.private {
+                        false
+                    } else {
+                        match func_type {
+                            FuncType::Local => parsed.exported,
+                            _ => parsed.exported || parsed.has_tags,
+                        }
                     };
                     apis.push(ApiDoc {
                         name,
@@ -109,6 +114,7 @@ impl LanguageParser for LuaParser {
                         params: parsed.params,
                         returns: parsed.returns,
                         notes: parsed.notes,
+                        usages: parsed.usages,
                         deprecated: parsed.deprecated,
                         todos: parsed.todos,
                         raw_comment: parsed.raw_comment,
@@ -287,7 +293,7 @@ fn join_continuation_lines(buffer: &mut Vec<String>) {
                 .trim_start()
                 .to_string();
             if !content.is_empty() {
-                buffer[i - 1].push(' ');
+                buffer[i - 1].push('\n');
                 buffer[i - 1].push_str(&content);
             }
             buffer.remove(i);

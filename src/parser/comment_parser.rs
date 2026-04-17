@@ -1,7 +1,7 @@
 //! 注释解析器：将 Token 节点转换为结构化文档字段。
 
 use crate::config::Config;
-use crate::ir::{ParamDoc, ReturnDoc};
+use crate::ir::{ParamDoc, ReturnDoc, UsageDoc};
 use crate::lexer::{lex, token::Token};
 
 /// API 注释解析结果。
@@ -11,16 +11,19 @@ pub struct ParsedComment {
     pub params: Vec<ParamDoc>,
     pub returns: Vec<ReturnDoc>,
     pub notes: Vec<String>,
+    pub usages: Vec<UsageDoc>,
     pub deprecated: bool,
     pub todos: Vec<String>,
     pub exported: bool,
+    pub private: bool,
     pub has_tags: bool,
     pub raw_comment: String,
 }
 
 /// 解析注释文本。
 pub fn parse_comment(raw_comment: &str, config: &Config) -> ParsedComment {
-    let tokens = lex(raw_comment);
+    let desugared = desugar_tag_lines(raw_comment, &config.default_format);
+    let tokens = lex(&desugared);
 
     let mut result = ParsedComment {
         raw_comment: raw_comment.to_string(),
@@ -91,6 +94,7 @@ fn apply_tag_segment(result: &mut ParsedComment, tag: &str, segment: &[Token], c
         "param" => {
             let name = detail
                 .name
+                .or_else(|| detail.plain_name.clone())
                 .or_else(|| {
                     detail
                         .content
@@ -99,9 +103,17 @@ fn apply_tag_segment(result: &mut ParsedComment, tag: &str, segment: &[Token], c
                         .map(ToString::to_string)
                 })
                 .unwrap_or_else(|| "unknown".to_string());
-            let description = detail
-                .description
-                .unwrap_or_else(|| detail.content.trim().to_string());
+            // Description priority:
+            //   1) Plain-text description inferred from the @param line (e.g. "购买参数,")
+            //      takes precedence over any \content{} value, so that a block-comment
+            //      --[[\content{...}]] following the @param line cannot contaminate it.
+            //   2) When there is no inline plain description (formal syntax: \name{} \content{}),
+            //      fall back to the \content{} value as the description.
+            //   3) When neither exists, use the implicit content string.
+            let description = match detail.description {
+                Some(desc) => desc,
+                None => detail.content.trim().to_string(),
+            };
             result.params.push(ParamDoc {
                 name,
                 type_name: detail.type_name,
@@ -120,6 +132,15 @@ fn apply_tag_segment(result: &mut ParsedComment, tag: &str, segment: &[Token], c
                 result.notes.push(detail.content);
             }
         }
+        "usage" => {
+            if !detail.content.is_empty() || detail.path.is_some() || detail.api_name.is_some() {
+                result.usages.push(UsageDoc {
+                    content: detail.content,
+                    path: detail.path,
+                    api_name: detail.api_name,
+                });
+            }
+        }
         "deprecated" => {
             result.deprecated = true;
             if !detail.content.is_empty() {
@@ -134,6 +155,9 @@ fn apply_tag_segment(result: &mut ParsedComment, tag: &str, segment: &[Token], c
         "export" => {
             result.exported = true;
         }
+        "private" => {
+            result.private = true;
+        }
         _ => {}
     }
 }
@@ -142,8 +166,12 @@ fn apply_tag_segment(result: &mut ParsedComment, tag: &str, segment: &[Token], c
 #[derive(Default)]
 struct SegmentDetail {
     name: Option<String>,
+    plain_name: Option<String>,
     type_name: Option<String>,
     default_value: Option<String>,
+    path: Option<String>,
+    api_name: Option<String>,
+    has_explicit_content: bool,
     content: String,
     description: Option<String>,
 }
@@ -163,8 +191,13 @@ fn parse_segment_detail(segment: &[Token], _default_format: &str) -> SegmentDeta
             } => match name.as_str() {
                 "name" => detail.name = Some(content.trim().to_string()),
                 "type" => detail.type_name = Some(content.trim().to_string()),
-                "default" => detail.default_value = Some(content.trim().to_string()),
-                "content" => explicit_content.push(content.trim().to_string()),
+                "default" | "defualt" => detail.default_value = Some(content.trim().to_string()),
+                "path" => detail.path = Some(content.trim().to_string()),
+                "apiname" => detail.api_name = Some(content.trim().to_string()),
+                "content" => {
+                    detail.has_explicit_content = true;
+                    explicit_content.push(content.trim().to_string())
+                }
                 _ => {}
             },
             Token::Text(text) => plain_text.push_str(text),
@@ -190,12 +223,260 @@ fn parse_segment_detail(segment: &[Token], _default_format: &str) -> SegmentDeta
     // 参数标签中：若普通文本以“name description”形式出现，拆分为描述。
     let trimmed_plain = plain_text.trim();
     if !trimmed_plain.is_empty() {
+        detail.plain_name = trimmed_plain
+            .split_whitespace()
+            .next()
+            .map(ToString::to_string);
         if let Some((_, desc)) = trimmed_plain.split_once(char::is_whitespace) {
             detail.description = Some(strip_leading_separator(desc.trim()).to_string());
         }
     }
 
     detail
+}
+
+/// 对标签行应用语法糖，将简单文本包装为 `\content[default_format]{...}`。
+///
+/// 支持的标签：
+/// - `@param name [\type type] content` → `@param \name{name} [\type{type}] \content[fmt]{content}`
+/// - `@brief content` → `@brief \content[fmt]{content}`
+/// - `@note content` → `@note \content[fmt]{content}`
+/// - `@todo content` → `@todo \content[fmt]{content}`
+/// - `@deprecated content` → `@deprecated \content[fmt]{content}`
+///
+/// 所有多行延续内容（`@ + 空白` 或普通文本行）用 `\n` 保持换行。
+fn desugar_tag_lines(raw: &str, default_format: &str) -> String {
+    let lines: Vec<&str> = raw.split('\n').collect();
+    let mut out = String::new();
+    let mut i = 0;
+
+    while i < lines.len() {
+        let trimmed = lines[i].trim_start();
+
+        // 尝试识别 @tag。
+        let (tag_name, body) = match try_strip_any_tag(trimmed) {
+            Some(pair) => pair,
+            None => {
+                if i > 0 {
+                    out.push('\n');
+                }
+                out.push_str(lines[i]);
+                i += 1;
+                continue;
+            }
+        };
+
+        let tag_lower = tag_name.to_ascii_lowercase();
+
+        if tag_lower == "param" {
+            // ── @param 语法糖 ──
+            if body.contains(r"\name{") || body.contains(r"\type{") {
+                if i > 0 {
+                    out.push('\n');
+                }
+                out.push_str(lines[i]);
+                i += 1;
+                continue;
+            }
+
+            // 若后续延续行包含显式 \content{...}，则只吃当前行和 continuation 行，不把 block comment 并入 param。
+            if has_explicit_content_continuation(&lines, i + 1) {
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(lines[i]);
+                i += 1;
+                // 只吃连续的 continuation 行，不吃 block comment 或新 tag。
+                while i < lines.len() {
+                    let next_trimmed = lines[i].trim_start();
+                    if next_trimmed.is_empty() {
+                        break;
+                    }
+                    if next_trimmed.starts_with('@') {
+                        if let Some(rest) = next_trimmed.strip_prefix('@') {
+                            let is_continuation =
+                                rest.is_empty() || rest.starts_with(' ') || rest.starts_with('\t');
+                            if !is_continuation {
+                                break;
+                            }
+                        }
+                    }
+                    // 若遇到 block comment 或显式 \content，终止 param sugar。
+                    if next_trimmed.starts_with("--[[") || next_trimmed.starts_with(r"\\content{") || next_trimmed.starts_with(r"\\content[") {
+                        break;
+                    }
+                    out.push('\n');
+                    out.push_str(lines[i]);
+                    i += 1;
+                }
+                continue;
+            }
+
+            let (name, type_name, first_content) = parse_sugar_param(body);
+
+            let mut content_parts: Vec<&str> = Vec::new();
+            if !first_content.is_empty() {
+                content_parts.push(first_content);
+            }
+            i += 1;
+            collect_continuation_lines(&lines, &mut i, &mut content_parts);
+
+            let merged_content = content_parts.join("\n");
+
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str("@param ");
+            out.push_str(&format!(r"\name{{{}}}", name));
+            if let Some(ref ty) = type_name {
+                out.push_str(&format!(r" \type{{{}}}", ty));
+            }
+            if !merged_content.is_empty() {
+                out.push_str(&format!(r" \content[{}]{{{}}}", default_format, merged_content));
+            }
+        } else if is_simple_content_tag(&tag_lower) {
+            // ── 简单内容标签语法糖：@brief / @note / @todo / @deprecated ──
+            if body.contains(r"\content{") || body.contains(r"\content[") {
+                if i > 0 {
+                    out.push('\n');
+                }
+                out.push_str(lines[i]);
+                i += 1;
+                continue;
+            }
+
+            let mut content_parts: Vec<&str> = Vec::new();
+            if !body.is_empty() {
+                content_parts.push(body);
+            }
+            i += 1;
+            collect_continuation_lines(&lines, &mut i, &mut content_parts);
+
+            let merged_content = content_parts.join("\n");
+
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(&format!("@{}", tag_name));
+            if !merged_content.is_empty() {
+                out.push_str(&format!(r" \content[{}]{{{}}}", default_format, merged_content));
+            }
+        } else {
+            // 其他标签：直接透传。
+            if i > 0 {
+                out.push('\n');
+            }
+            out.push_str(lines[i]);
+            i += 1;
+        }
+    }
+
+    out
+}
+
+/// 判断是否为简单内容标签（整个 body 视为 content）。
+fn is_simple_content_tag(tag_lower: &str) -> bool {
+    matches!(tag_lower, "brief" | "breif" | "note" | "todo" | "deprecated" | "usage")
+}
+
+/// 从 trimmed 行中提取 `@tag` 名称和标签后的内容。
+fn try_strip_any_tag(trimmed: &str) -> Option<(&str, &str)> {
+    if !trimmed.starts_with('@') {
+        return None;
+    }
+    let after_at = &trimmed[1..];
+    let tag_end = after_at
+        .find(|c: char| !c.is_alphanumeric() && c != '_')
+        .unwrap_or(after_at.len());
+    if tag_end == 0 {
+        return None;
+    }
+    let tag_name = &after_at[..tag_end];
+    let after = &after_at[tag_end..];
+    let after = after.strip_prefix(':').unwrap_or(after);
+    Some((tag_name, after.trim_start()))
+}
+
+/// 收集延续行（不以新 @tag 开头的后续行），用 `\n` 保持换行。
+fn collect_continuation_lines<'a>(lines: &[&'a str], i: &mut usize, parts: &mut Vec<&'a str>) {
+    while *i < lines.len() {
+        let next_trimmed = lines[*i].trim_start();
+        if next_trimmed.is_empty() {
+            break;
+        }
+        if next_trimmed.starts_with('@') {
+            if let Some(rest) = next_trimmed.strip_prefix('@') {
+                let is_continuation =
+                    rest.is_empty() || rest.starts_with(' ') || rest.starts_with('\t');
+                if is_continuation {
+                    let cont = rest.trim_start();
+                    if !cont.is_empty() {
+                        parts.push(cont);
+                    }
+                    *i += 1;
+                    continue;
+                }
+            }
+            break;
+        }
+        parts.push(next_trimmed);
+        *i += 1;
+    }
+}
+
+fn has_explicit_content_continuation(lines: &[&str], mut i: usize) -> bool {
+    while i < lines.len() {
+        let next_trimmed = lines[i].trim_start();
+        if next_trimmed.is_empty() {
+            break;
+        }
+        if next_trimmed.starts_with('@') {
+            if let Some(rest) = next_trimmed.strip_prefix('@') {
+                let is_continuation =
+                    rest.is_empty() || rest.starts_with(' ') || rest.starts_with('\t');
+                if !is_continuation {
+                    break;
+                }
+            }
+        }
+        if next_trimmed.starts_with(r"\content{") || next_trimmed.starts_with(r"\content[") {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// 从语法糖体中提取 (name, Option<type>, remaining_content)。
+///
+/// 格式：`param_name [\type param_type] content...`
+fn parse_sugar_param(body: &str) -> (&str, Option<&str>, &str) {
+    let body = body.trim_start();
+    if body.is_empty() {
+        return ("unknown", None, "");
+    }
+
+    // 提取 param_name（第一个非空白 token，去除尾部逗号）。
+    let name_end = body
+        .find(|c: char| c.is_whitespace())
+        .unwrap_or(body.len());
+    let raw_name = &body[..name_end];
+    let name = raw_name.trim_end_matches(',');
+    let rest = body[name_end..].trim_start();
+
+    // 检查是否有 `\type param_type`。
+    if let Some(after_type) = rest.strip_prefix(r"\type") {
+        let after_type = after_type.trim_start();
+        // 提取 type 名称（到下一个空白）。
+        let type_end = after_type
+            .find(|c: char| c.is_whitespace())
+            .unwrap_or(after_type.len());
+        let type_name = &after_type[..type_end];
+        let content = after_type[type_end..].trim_start();
+        (name, Some(type_name), content)
+    } else {
+        (name, None, rest)
+    }
 }
 
 fn extract_plain_text(segment: &[Token]) -> String {
